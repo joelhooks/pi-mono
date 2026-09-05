@@ -80,6 +80,7 @@ import {
 	type MessageStartEvent,
 	type MessageUpdateEvent,
 	type ReplacedSessionContext,
+	type SessionBeforeAutoCompactResult,
 	type SessionBeforeCompactResult,
 	type SessionBeforeTreeResult,
 	type SessionCompactFailedEvent,
@@ -164,6 +165,8 @@ export type AgentSessionEvent =
 			result: CompactionResult | undefined;
 			aborted: boolean;
 			willRetry: boolean;
+			/** True when automatic compaction was replaced by a committed context-window boundary. */
+			contextWindowStarted?: boolean;
 			errorMessage?: string;
 	  }
 	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
@@ -2255,9 +2258,44 @@ export class AgentSession {
 				return false;
 			}
 
-			const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model);
-
 			const pathEntries = this.sessionManager.getBranch();
+			this._autoCompactionAbortController = new AbortController();
+
+			if (this._extensionRunner.hasHandlers("session_before_auto_compact")) {
+				const claim = (await this._extensionRunner.emit({
+					type: "session_before_auto_compact",
+					branchEntries: pathEntries,
+					reason,
+					willRetry,
+					signal: this._autoCompactionAbortController.signal,
+				})) as SessionBeforeAutoCompactResult | undefined;
+
+				if (this._autoCompactionAbortController.signal.aborted) {
+					return false;
+				}
+
+				if (claim?.newContext) {
+					fromExtension = true;
+					this._emit({ type: "compaction_start", reason });
+					started = true;
+					this.sessionManager.appendContextWindow(
+						claim.newContext.handoff,
+						this.getContextUsage()?.tokens ?? null,
+					);
+					this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
+					this._emit({
+						type: "compaction_end",
+						reason,
+						result: undefined,
+						aborted: false,
+						willRetry,
+						contextWindowStarted: true,
+					});
+					return willRetry || this.agent.hasQueuedMessages();
+				}
+			}
+
+			const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model);
 
 			const preparation = prepareCompaction(pathEntries, settings);
 			if (!preparation) {
@@ -2265,7 +2303,6 @@ export class AgentSession {
 			}
 
 			this._emit({ type: "compaction_start", reason });
-			this._autoCompactionAbortController = new AbortController();
 			started = true;
 
 			let extensionCompaction: CompactionResult | undefined;

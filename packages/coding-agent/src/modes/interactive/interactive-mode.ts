@@ -3412,27 +3412,29 @@ export class InteractiveMode {
 					} else {
 						this.showStatus("Auto-compaction cancelled");
 					}
-				} else if (event.result) {
+				} else if (event.result || event.contextWindowStarted) {
 					const entries = this.sessionManager.buildContextEntries();
-					if (entries[0]?.type !== "compaction") {
+					if (event.result && entries[0]?.type !== "compaction") {
 						throw new Error("Completed compaction is missing from the session context");
 					}
 					this.chatContainer.clear();
 					// The latest compaction is prepended for model context; append it below at its chronological position.
-					this.renderSessionEntries(entries.slice(1));
-					this.addMessageToChat(
-						createCompactionSummaryMessage(
-							event.result.summary,
-							event.result.tokensBefore,
-							new Date().toISOString(),
-						),
-					);
-					if (event.result.usage) {
-						this.addCompactionCostNotice({
-							type: "compaction_cost",
-							kind: "compaction",
-							usage: event.result.usage,
-						});
+					this.renderSessionEntries(event.result ? entries.slice(1) : entries);
+					if (event.result) {
+						this.addMessageToChat(
+							createCompactionSummaryMessage(
+								event.result.summary,
+								event.result.tokensBefore,
+								new Date().toISOString(),
+							),
+						);
+						if (event.result.usage) {
+							this.addCompactionCostNotice({
+								type: "compaction_cost",
+								kind: "compaction",
+								usage: event.result.usage,
+							});
+						}
 					}
 					this.footer.invalidate();
 				} else if (event.errorMessage) {

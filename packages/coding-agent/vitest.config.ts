@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import { defineConfig, mergeConfig } from "vitest/config";
 import baseConfig, { workspaceSourcePaths } from "../../vitest.base.ts";
 
@@ -21,6 +22,10 @@ export default mergeConfig(
 		},
 		resolve: {
 			alias: [
+				{
+					find: /^@earendil-works\/pi-ai\/utils\/(.+)$/,
+					replacement: `${fileURLToPath(new URL("../ai/src/utils", import.meta.url))}/$1.ts`,
+				},
 				{ find: /^@earendil-works\/pi-ai$/, replacement: workspaceSourcePaths.aiIndex },
 				{ find: /^@earendil-works\/pi-agent-core$/, replacement: workspaceSourcePaths.agentIndex },
 				{ find: /^@mariozechner\/pi-ai$/, replacement: workspaceSourcePaths.aiIndex },

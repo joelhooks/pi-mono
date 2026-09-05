@@ -47,6 +47,7 @@ export type {
 	// Event Results
 	ContextEventResult,
 	ContextUsage,
+	ContextWindowRequest,
 	CustomToolCallEvent,
 	CustomToolResultEvent,
 	EditorFactory,
@@ -127,6 +128,8 @@ export type {
 	ResourcesDiscoverResult,
 	SendMessageHandler,
 	SendUserMessageHandler,
+	SessionBeforeAutoCompactEvent,
+	SessionBeforeAutoCompactResult,
 	SessionBeforeCompactEvent,
 	SessionBeforeCompactResult,
 	SessionBeforeForkEvent,

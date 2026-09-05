@@ -751,6 +751,13 @@ export function prepareCompaction(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
 ): CompactionPreparation | undefined {
+	for (let i = pathEntries.length - 1; i >= 0; i--) {
+		if (pathEntries[i].type === "context_window") {
+			pathEntries = pathEntries.slice(i);
+			break;
+		}
+	}
+
 	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
 		return undefined;
 	}

@@ -91,14 +91,14 @@ describe("loadEntriesFromFile", () => {
 		expect(readFileSync(file, "utf8")).toBe(`${content}\n`);
 	});
 
-	it("adds a newline after an unterminated malformed final fragment", () => {
+	it("does not modify an unterminated malformed final fragment", () => {
 		const file = join(tempDir, "malformed-tail.jsonl");
 		const content =
 			'{"type":"session","id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n' + '{"type":"message"';
 		writeFileSync(file, content);
 
 		expect(loadEntriesFromFile(file)).toHaveLength(1);
-		expect(readFileSync(file, "utf8")).toBe(`${content}\n`);
+		expect(readFileSync(file, "utf8")).toBe(content);
 	});
 
 	it("does not modify an unterminated non-session file", () => {
@@ -369,6 +369,51 @@ describe("SessionManager.setSessionFile with corrupted files", () => {
 			`Session file is not a valid pi session: ${noHeaderFile}`,
 		);
 		expect(readFileSync(noHeaderFile, "utf-8")).toBe(originalContent);
+	});
+
+	it("keeps the active aggregate and file selection after a rejected file switch", () => {
+		const originalFile = join(tempDir, "original.jsonl");
+		const messageId = "message-1";
+		writeFileSync(
+			originalFile,
+			`${JSON.stringify({
+				type: "session",
+				version: 3,
+				id: "original",
+				timestamp: "2025-01-01T00:00:00Z",
+				cwd: tempDir,
+			})}\n${JSON.stringify({
+				type: "message",
+				id: messageId,
+				parentId: null,
+				timestamp: "2025-01-01T00:00:01Z",
+				message: { role: "user", content: "kept", timestamp: 1 },
+			})}\n`,
+		);
+		const session = SessionManager.open(originalFile, tempDir);
+		session.appendLabelChange(messageId, "checkpoint");
+		const originalBytes = readFileSync(originalFile);
+		const invalidFile = join(tempDir, "invalid.jsonl");
+		const invalidBytes = Buffer.from('{"type":"event","data":"not a session"}\n');
+		writeFileSync(invalidFile, invalidBytes);
+		const entries = session.getEntries();
+		const leafId = session.getLeafId();
+		const context = session.buildSessionContext();
+
+		expect(() => session.setSessionFile(invalidFile)).toThrow(
+			`Session file is not a valid pi session: ${invalidFile}`,
+		);
+		expect(session.getSessionFile()).toBe(originalFile);
+		expect(session.getEntries()).toEqual(entries);
+		expect(session.getLeafId()).toBe(leafId);
+		expect(session.buildSessionContext()).toEqual(context);
+		expect(session.getLabel(messageId)).toBe("checkpoint");
+		expect(readFileSync(originalFile)).toEqual(originalBytes);
+		expect(readFileSync(invalidFile)).toEqual(invalidBytes);
+
+		const appendedId = session.appendMessage({ role: "user", content: "still original", timestamp: 2 });
+		expect(readFileSync(invalidFile)).toEqual(invalidBytes);
+		expect(SessionManager.open(originalFile).getEntry(appendedId)).toBeDefined();
 	});
 
 	it("throws and preserves non-session JSONL files", () => {

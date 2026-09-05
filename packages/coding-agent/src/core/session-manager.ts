@@ -9,6 +9,7 @@ import {
 	mkdirSync,
 	openSync,
 	readdirSync,
+	readFileSync,
 	readSync,
 	statSync,
 	writeFileSync,
@@ -28,6 +29,7 @@ import {
 } from "./messages.ts";
 
 export const CURRENT_SESSION_VERSION = 3;
+export const MAX_CONTEXT_HANDOFF_CHARS = 20_000;
 
 export interface SessionHeader {
 	type: "session";
@@ -64,6 +66,14 @@ export interface ModelChangeEntry extends SessionEntryBase {
 	type: "model_change";
 	provider: string;
 	modelId: string;
+}
+
+export interface ContextWindowEntry extends SessionEntryBase {
+	type: "context_window";
+	/** Optional continuation state supplied by the previous window. */
+	handoff?: string;
+	/** Active context size immediately before the window transition, when known. */
+	tokensBefore: number | null;
 }
 
 export interface CompactionEntry<T = unknown> extends SessionEntryBase {
@@ -145,6 +155,7 @@ export type SessionEntry =
 	| SessionMessageEntry
 	| ThinkingLevelChangeEntry
 	| ModelChangeEntry
+	| ContextWindowEntry
 	| CompactionEntry
 	| BranchSummaryEntry
 	| CustomEntry
@@ -401,6 +412,18 @@ export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage
 	if (entry.type === "branch_summary" && entry.summary) {
 		return [createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp)];
 	}
+	if (entry.type === "context_window") {
+		const handoff = entry.handoff ? `\n\nHandoff from the previous window:\n${entry.handoff}` : "";
+		return [
+			createCustomMessage(
+				"context-window",
+				`Context window ${entry.id} starts here. Earlier conversation is not available in this window.${handoff}`,
+				true,
+				{ windowId: entry.id, tokensBefore: entry.tokensBefore },
+				entry.timestamp,
+			),
+		];
+	}
 	if (entry.type === "compaction") {
 		return [createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp)];
 	}
@@ -410,17 +433,25 @@ export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage
 /**
  * Build the active, compaction-aware session entry list.
  *
- * This follows the current leaf path. If the path contains compaction entries,
- * the latest compaction is represented by the compaction entry itself, followed
- * by the kept entries starting at firstKeptEntryId and all entries after the
- * compaction entry. Older summarized entries are omitted.
+ * This follows the current leaf path. Entries before the latest context-window
+ * boundary are omitted. Within that window, the latest compaction is represented
+ * by the compaction entry itself, followed by the kept entries starting at
+ * firstKeptEntryId and all entries after the compaction entry.
  */
 export function buildContextEntries(
 	entries: SessionEntry[],
 	leafId?: string | null,
 	byId?: Map<string, SessionEntry>,
 ): SessionEntry[] {
-	const path = buildSessionPath(entries, leafId, byId);
+	const fullPath = buildSessionPath(entries, leafId, byId);
+	let contextWindowIndex = -1;
+	for (let i = fullPath.length - 1; i >= 0; i--) {
+		if (fullPath[i].type === "context_window") {
+			contextWindowIndex = i;
+			break;
+		}
+	}
+	const path = contextWindowIndex === -1 ? fullPath : fullPath.slice(contextWindowIndex);
 	let compaction: CompactionEntry | null = null;
 
 	for (const entry of path) {
@@ -510,10 +541,16 @@ function parseSessionEntryLine(line: string): FileEntry | null {
 	}
 }
 
-/** Exported for testing */
-export function loadEntriesFromFile(filePath: string): FileEntry[] {
+type SessionPersistenceState = { status: "writable" } | { status: "uncertain"; reason: string };
+
+interface LoadedSessionFile {
+	entries: FileEntry[];
+	invalidFinalTail: boolean;
+}
+
+function loadSessionFile(filePath: string): LoadedSessionFile {
 	const resolvedFilePath = normalizePath(filePath);
-	if (!existsSync(resolvedFilePath)) return [];
+	if (!existsSync(resolvedFilePath)) return { entries: [], invalidFinalTail: false };
 
 	const entries: FileEntry[] = [];
 	let pending = "";
@@ -545,15 +582,22 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 		closeSync(fd);
 	}
 
-	// Validate session header before repairing the file.
-	if (entries.length === 0) return entries;
+	const invalidFinalTail = pending.length > 0 && parseSessionEntryLine(pending) === null;
+
+	// Validate session header before repairing a complete final JSON record.
+	if (entries.length === 0) return { entries, invalidFinalTail };
 	const header = entries[0];
 	if (header.type !== "session" || typeof (header as { id?: unknown }).id !== "string") {
-		return [];
+		return { entries: [], invalidFinalTail };
 	}
 
-	if (pending) appendFileSync(resolvedFilePath, "\n");
-	return entries;
+	if (pending && !invalidFinalTail) appendFileSync(resolvedFilePath, "\n");
+	return { entries, invalidFinalTail };
+}
+
+/** Exported for testing */
+export function loadEntriesFromFile(filePath: string): FileEntry[] {
+	return loadSessionFile(filePath).entries;
 }
 
 /**
@@ -860,6 +904,7 @@ export class SessionManager {
 	private cwd: string;
 	private persist: boolean;
 	private flushed: boolean = false;
+	private persistenceState: SessionPersistenceState = { status: "writable" };
 	private fileEntries: FileEntry[] = [];
 	private byId: Map<string, SessionEntry> = new Map();
 	private labelsById: Map<string, string> = new Map();
@@ -873,6 +918,7 @@ export class SessionManager {
 		persist: boolean,
 		newSessionOptions?: NewSessionOptions,
 		preloadedFileEntries?: FileEntry[],
+		preloadedPersistenceState?: SessionPersistenceState,
 	) {
 		this.cwd = resolvePath(cwd);
 		this.sessionDir = normalizePath(sessionDir);
@@ -882,7 +928,7 @@ export class SessionManager {
 		}
 
 		if (sessionFile) {
-			this._setSessionFile(sessionFile, preloadedFileEntries);
+			this._setSessionFile(sessionFile, preloadedFileEntries, preloadedPersistenceState);
 		} else if (preloadedFileEntries?.length) {
 			this._loadEntries(preloadedFileEntries, newSessionOptions);
 		} else {
@@ -895,31 +941,48 @@ export class SessionManager {
 		this._setSessionFile(sessionFile);
 	}
 
-	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
-		this.sessionFile = resolvePath(sessionFile);
-		if (existsSync(this.sessionFile)) {
-			const entries = preloadedFileEntries ?? loadEntriesFromFile(this.sessionFile);
+	private _setSessionFile(
+		sessionFile: string,
+		preloadedFileEntries?: FileEntry[],
+		preloadedPersistenceState?: SessionPersistenceState,
+	): void {
+		const resolvedSessionFile = resolvePath(sessionFile);
+		if (existsSync(resolvedSessionFile)) {
+			const loaded = preloadedFileEntries
+				? {
+						entries: preloadedFileEntries,
+						invalidFinalTail: preloadedPersistenceState?.status === "uncertain",
+					}
+				: loadSessionFile(resolvedSessionFile);
+			const entries = loaded.entries;
 
 			// If file was empty, initialize it with a valid session header. If it was
 			// non-empty but did not parse as a pi session, fail without modifying it.
 			if (entries.length === 0) {
-				const explicitPath = this.sessionFile;
-				if (statSync(explicitPath).size > 0) {
-					throw new Error(`Session file is not a valid ${APP_NAME} session: ${explicitPath}`);
+				if (statSync(resolvedSessionFile).size > 0) {
+					throw new Error(`Session file is not a valid ${APP_NAME} session: ${resolvedSessionFile}`);
 				}
 				this.newSession();
-				this.sessionFile = explicitPath;
+				this.sessionFile = resolvedSessionFile;
 				this._rewriteFile();
 				this.flushed = true;
 				return;
 			}
 
+			this.sessionFile = resolvedSessionFile;
+			this.persistenceState =
+				preloadedPersistenceState ??
+				(loaded.invalidFinalTail
+					? {
+							status: "uncertain",
+							reason: "the session file has an invalid non-empty final JSONL tail",
+						}
+					: { status: "writable" });
 			this._loadEntries(entries);
 			this.flushed = true;
 		} else {
-			const explicitPath = this.sessionFile;
 			this.newSession();
-			this.sessionFile = explicitPath; // preserve explicit path from --session flag
+			this.sessionFile = resolvedSessionFile; // preserve explicit path from --session flag
 		}
 	}
 
@@ -943,6 +1006,7 @@ export class SessionManager {
 		this.labelTimestampsById.clear();
 		this.leafId = null;
 		this.flushed = false;
+		this.persistenceState = { status: "writable" };
 
 		if (this.persist) {
 			const fileTimestamp = timestamp.replace(/[:.]/g, "-");
@@ -958,7 +1022,7 @@ export class SessionManager {
 			this.fileEntries = entries;
 			this.sessionId = header.id;
 
-			if (migrateToCurrentVersion(this.fileEntries)) {
+			if (migrateToCurrentVersion(this.fileEntries) && this.persistenceState.status === "writable") {
 				this._rewriteFile();
 			}
 		} else {
@@ -1055,7 +1119,50 @@ export class SessionManager {
 		}
 	}
 
+	private _createSessionFileForContextWindow(): void {
+		if (!this.sessionFile) throw new Error("Context window persistence requires a session file");
+		const fd = openSync(this.sessionFile, "wx");
+		try {
+			for (const entry of this.fileEntries) {
+				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
+			}
+		} finally {
+			closeSync(fd);
+		}
+	}
+
+	private _contextWindowPersistenceState(expectedContents: Buffer): "framed" | "missing_delimiter" | "mismatch" {
+		if (!this.sessionFile) return "mismatch";
+		const contents = readFileSync(this.sessionFile);
+		if (contents.equals(expectedContents)) return "framed";
+		if (contents.equals(expectedContents.subarray(0, expectedContents.length - 1))) return "missing_delimiter";
+		return "mismatch";
+	}
+
+	private _ensureContextWindowFramed(expectedContents: Buffer): boolean {
+		const state = this._contextWindowPersistenceState(expectedContents);
+		if (state === "framed") return true;
+		if (state !== "missing_delimiter" || !this.sessionFile) return false;
+
+		try {
+			appendFileSync(this.sessionFile, "\n");
+		} catch (error) {
+			if (this._contextWindowPersistenceState(expectedContents) === "framed") return true;
+			throw error;
+		}
+		return this._contextWindowPersistenceState(expectedContents) === "framed";
+	}
+
+	private _assertPersistenceWritable(): void {
+		if (this.persistenceState.status === "uncertain") {
+			throw new Error(
+				`Session persistence is uncertain; reopen after repairing or recovering the session file before writing: ${this.persistenceState.reason}`,
+			);
+		}
+	}
+
 	private _appendEntry(entry: SessionEntry): void {
+		this._assertPersistenceWritable();
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
@@ -1104,6 +1211,106 @@ export class SessionManager {
 			modelId,
 		};
 		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	/** Append a fresh context-window boundary as child of current leaf, then advance leaf. Returns entry id. */
+	appendContextWindow(handoff: string | undefined, tokensBefore: number | null): string {
+		if (handoff && handoff.length > MAX_CONTEXT_HANDOFF_CHARS) {
+			throw new Error(`Context window handoff exceeds ${MAX_CONTEXT_HANDOFF_CHARS} character limit`);
+		}
+		const entry: ContextWindowEntry = {
+			type: "context_window",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			handoff,
+			tokensBefore,
+		};
+		this._assertPersistenceWritable();
+		const previousLeafId = this.leafId;
+		const requireCompleteFile = this.persist && !this.flushed;
+		let expectedContents: Buffer | undefined;
+		let preBoundaryContents: Buffer | undefined;
+		if (this.persist) {
+			if (!this.sessionFile) throw new Error("Context window persistence requires a session file");
+			if (requireCompleteFile) {
+				expectedContents = Buffer.from(
+					[...this.fileEntries, entry].map((fileEntry) => `${JSON.stringify(fileEntry)}\n`).join(""),
+				);
+			} else {
+				try {
+					preBoundaryContents = readFileSync(this.sessionFile);
+				} catch (error) {
+					this.persistenceState = {
+						status: "uncertain",
+						reason: `the session file could not be read before a context window write: ${error instanceof Error ? error.message : String(error)}`,
+					};
+					throw error;
+				}
+				if (preBoundaryContents.length === 0 || preBoundaryContents[preBoundaryContents.length - 1] !== 0x0a) {
+					this.persistenceState = {
+						status: "uncertain",
+						reason: "the session file was not newline-framed before a context window write",
+					};
+					throw new Error("Context window persistence requires an existing newline-framed session file");
+				}
+				expectedContents = Buffer.concat([preBoundaryContents, Buffer.from(`${JSON.stringify(entry)}\n`)]);
+			}
+		}
+		try {
+			this._appendEntry(entry);
+			if (requireCompleteFile && !this.flushed) {
+				this._createSessionFileForContextWindow();
+			}
+			if (expectedContents && !this._ensureContextWindowFramed(expectedContents)) {
+				throw new Error("Context window persistence did not produce an exact complete JSONL record");
+			}
+			if (this.persist) this.flushed = true;
+		} catch (error) {
+			let readbackError: unknown;
+			if (expectedContents && this.sessionFile && (!requireCompleteFile || existsSync(this.sessionFile))) {
+				try {
+					if (this._ensureContextWindowFramed(expectedContents)) {
+						this.flushed = true;
+						return entry.id;
+					}
+				} catch (readError) {
+					readbackError = readError;
+				}
+			}
+
+			const entryIndex = this.fileEntries.lastIndexOf(entry);
+			if (entryIndex !== -1) {
+				this.fileEntries.splice(entryIndex, 1);
+			}
+			this.byId.delete(entry.id);
+			this.leafId = previousLeafId;
+
+			let rollbackIsProven = !this.persist;
+			if (this.persist && this.sessionFile) {
+				try {
+					rollbackIsProven = requireCompleteFile
+						? !existsSync(this.sessionFile)
+						: preBoundaryContents !== undefined && readFileSync(this.sessionFile).equals(preBoundaryContents);
+				} catch (rollbackReadError) {
+					readbackError ??= rollbackReadError;
+				}
+			}
+			if (!rollbackIsProven) {
+				const detail = readbackError
+					? `the final file state could not be read back: ${readbackError instanceof Error ? readbackError.message : String(readbackError)}`
+					: "the session file differs from its exact pre-boundary state";
+				this.persistenceState = { status: "uncertain", reason: `a context window write failed and ${detail}` };
+			}
+			if (readbackError) {
+				const message = readbackError instanceof Error ? readbackError.message : String(readbackError);
+				throw new Error(`Context window persistence failed and final state could not be verified: ${message}`, {
+					cause: error,
+				});
+			}
+			throw error;
+		}
 		return entry.id;
 	}
 
@@ -1402,6 +1609,7 @@ export class SessionManager {
 		if (branchFromId !== null && !this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
+		this._assertPersistenceWritable();
 		const fromId = this.leafId ?? "root";
 		this.leafId = branchFromId;
 		const entry: BranchSummaryEntry = {
@@ -1563,6 +1771,7 @@ export class SessionManager {
 		const resolvedPath = resolvePath(path);
 		let header: SessionHeader | null = null;
 		let preloadedFileEntries: FileEntry[] | undefined;
+		let preloadedPersistenceState: SessionPersistenceState | undefined;
 		if (cwdOverride === undefined && existsSync(resolvedPath)) {
 			try {
 				header = readSessionHeader(resolvedPath);
@@ -1570,7 +1779,14 @@ export class SessionManager {
 				if (!(error instanceof SessionHeaderScanLimitError)) throw error;
 				// The bounded scan is only a discovery optimization. A full load remains
 				// authoritative for legacy files with very large headers or prefixes.
-				preloadedFileEntries = loadEntriesFromFile(resolvedPath);
+				const loaded = loadSessionFile(resolvedPath);
+				preloadedFileEntries = loaded.entries;
+				if (loaded.invalidFinalTail) {
+					preloadedPersistenceState = {
+						status: "uncertain",
+						reason: "the session file has an invalid non-empty final JSONL tail",
+					};
+				}
 				const firstEntry = preloadedFileEntries[0];
 				header = firstEntry?.type === "session" ? firstEntry : null;
 			}
@@ -1578,7 +1794,15 @@ export class SessionManager {
 		const cwd = cwdOverride ?? (header ? getSessionHeaderCwd(header) : undefined) ?? process.cwd();
 		// If no sessionDir provided, derive from file's parent directory
 		const dir = sessionDir ? normalizePath(sessionDir) : resolve(resolvedPath, "..");
-		return new SessionManager(cwd, dir, resolvedPath, true, undefined, preloadedFileEntries);
+		return new SessionManager(
+			cwd,
+			dir,
+			resolvedPath,
+			true,
+			undefined,
+			preloadedFileEntries,
+			preloadedPersistenceState,
+		);
 	}
 
 	/**
